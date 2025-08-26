@@ -1,0 +1,325 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import kurtosis, skew
+import os
+from matplotlib.colors import LinearSegmentedColormap
+
+# ======== 读取CSV文件 ========
+file_path = r"E:\动态电池原始数据库\Publishing_data_raw_data_cell_025.csv"
+df = pd.read_csv(file_path)
+
+# ======== 重命名列，便于处理 ========
+df.rename(columns={
+    'Test (Sec)': 'Time_s',
+    'Normalized Current (C-rate)': 'Current_C',
+    'Volts': 'Voltage_V',
+    'Cyc#': 'Cycle',
+    'State': 'State',
+    'Normalized Capacity (nominal capacity unit)': 'Capacity'
+}, inplace=True)
+
+# ======== 预处理 ========
+df = df[df['Cycle'].notna() & (df['Cycle'] >= 1)]
+df['Cycle'] = df['Cycle'].astype(int)
+
+# ======== 创建保存文件夹 ========
+os.makedirs("E:\Energitic-project-1-main\charging_combined_plots", exist_ok=True)
+
+# ======== 初始化结果存储 ========
+results = []
+
+# ======== 准备可视化数据 ========
+cc_voltage_data = []  # 存储每个循环的CC阶段(时间, 电压)数据
+cv_current_data = []  # 存储每个循环的CV阶段(时间, 电流)数据
+cc_cycles = []        # 存储有CC阶段的循环号
+cv_cycles = []        # 存储有CV阶段的循环号
+
+# ======== 创建自定义颜色映射 ========
+# 深蓝到浅蓝表示循环次数增加
+cmap_blue = LinearSegmentedColormap.from_list('blue_cmap', ['#003366', '#66ccff'])
+
+# ======== 遍历每个循环 ========
+for cycle in sorted(df['Cycle'].unique()):
+    cycle_df = df[df['Cycle'] == cycle].copy()
+    if cycle_df.empty:
+        continue
+        
+    # ===== 提取CC阶段：电压从3.8V到4.2V =====
+    cc_start_idx = None
+    cc_end_idx = None
+    valid_cc = False  # 标记是否满足初始电流条件
+    
+    # 找到首次达到3.8V的点
+    above_38 = cycle_df[cycle_df['Voltage_V'] >= 3.8]
+    if not above_38.empty:
+        cc_start_idx = above_38.index[0]
+        
+        # 找到从起始点开始首次达到4.2V的点
+        after_start = cycle_df.loc[cc_start_idx:]
+        above_42 = after_start[after_start['Voltage_V'] >= 4.2]
+        if not above_42.empty:
+            cc_end_idx = above_42.index[0]
+    
+    # ===== 检查初始电流条件 =====
+    if cc_start_idx is not None and cc_end_idx is not None:
+        # 获取CC阶段的第一个电流值
+        initial_current = abs(cycle_df.loc[cc_start_idx, 'Current_C'])
+        # 只有当初始电流大于0.4C时才继续处理
+        if initial_current > 0.4:
+            valid_cc = True
+            print(f"Cycle {cycle}: 初始电流 {initial_current:.2f}C > 0.4C，符合条件")
+        else:
+            print(f"Cycle {cycle}: 初始电流 {initial_current:.2f}C ≤ 0.4C，跳过")
+    else:
+        print(f"Cycle {cycle}: 未找到有效的CC阶段")
+    
+    # ===== 提取CV阶段：电流从0.5C到0.1C =====
+    cv_start_idx = None
+    cv_end_idx = None
+    
+    # 在CC阶段之后寻找CV阶段
+    if valid_cc and cc_end_idx is not None:
+        post_cc = cycle_df.loc[cc_end_idx:]
+        
+        # 找到首次电流≤0.5C的点
+        below_05 = post_cc[post_cc['Current_C'] <= 0.5]
+        if not below_05.empty:
+            cv_start_idx = below_05.index[0]
+            
+            # 找到从起始点开始首次达到0.1C的点
+            after_cv_start = cycle_df.loc[cv_start_idx:]
+            below_01 = after_cv_start[after_cv_start['Current_C'] <= 0.1]
+            if not below_01.empty:
+                cv_end_idx = below_01.index[0]
+    
+    # ===== 计算CC阶段特征 =====
+    cc_features = {}
+    if valid_cc and cc_start_idx is not None and cc_end_idx is not None:
+        cc_segment = cycle_df.loc[cc_start_idx:cc_end_idx]
+        if not cc_segment.empty:
+            # 电压特征
+            volts = cc_segment['Voltage_V'].values
+            cc_features['CC_voltage_mean'] = np.mean(volts)
+            cc_features['CC_voltage_std'] = np.std(volts, ddof=1)
+            cc_features['CC_voltage_kurtosis'] = kurtosis(volts, fisher=True)
+            cc_features['CC_voltage_skewness'] = skew(volts)
+            
+            # 时间特征
+            time = cc_segment['Time_s'].values
+            cc_features['CC_charge_time'] = time[-1] - time[0]
+            
+            # 电流积分
+            current = cc_segment['Current_C'].values
+            cc_features['CC_accumulated_charge'] = np.trapz(current, time) / 3600  # 转换为Ah
+            
+            # 斜率
+            cc_features['CC_voltage_slope'] = (volts[-1] - volts[0]) / cc_features['CC_charge_time']
+            
+            # 熵
+            prob = current / (np.sum(current) + 1e-10)
+            cc_features['CC_entropy'] = -np.sum(prob * np.log(prob + 1e-10))
+            
+            # 容量变化
+            cap = cc_segment['Capacity'].values
+            cc_features['CC_capacity_change'] = cap[-1] - cap[0] if len(cap) > 0 else 0
+            
+            # 保存CC阶段数据用于可视化（仅当持续时间>1000秒）
+            relative_time = time - time[0]
+            if relative_time[-1] > 1000:  # 添加持续时间条件
+                cc_voltage_data.append((relative_time, volts))
+                cc_cycles.append(cycle)
+    
+    # ===== 计算CV阶段特征 =====
+    cv_features = {}
+    if valid_cc and cv_start_idx is not None and cv_end_idx is not None:
+        cv_segment = cycle_df.loc[cv_start_idx:cv_end_idx]
+        if not cv_segment.empty:
+            # 电流特征
+            current = cv_segment['Current_C'].values
+            cv_features['CV_current_mean'] = np.mean(current)
+            cv_features['CV_current_std'] = np.std(current, ddof=1)
+            cv_features['CV_current_kurtosis'] = kurtosis(current, fisher=True)
+            cv_features['CV_current_skewness'] = skew(current)
+            
+            # 时间特征
+            time = cv_segment['Time_s'].values
+            cv_features['CV_charge_time'] = time[-1] - time[0]
+            
+            # 电流积分
+            cv_features['CV_accumulated_charge'] = np.trapz(current, time) / 3600  # 转换为Ah
+            
+            # 斜率
+            cv_features['CV_current_slope'] = (current[-1] - current[0]) / cv_features['CV_charge_time']
+            
+            # 熵
+            prob = current / (np.sum(current) + 1e-10)
+            cv_features['CV_entropy'] = -np.sum(prob * np.log(prob + 1e-10))
+            
+            # 容量变化
+            cap = cv_segment['Capacity'].values
+            cv_features['CV_capacity_change'] = cap[-1] - cap[0] if len(cap) > 0 else 0
+            
+            # 保存CV阶段数据用于可视化（仅当持续时间>1000秒）
+            relative_time = time - time[0]
+            if relative_time[-1] > 1000:  # 添加持续时间条件
+                cv_current_data.append((relative_time, current))
+                cv_cycles.append(cycle)
+    
+    # ===== 保存结果 =====
+    if cc_features or cv_features:
+        result_row = {'Cycle': cycle}
+        result_row.update(cc_features)
+        result_row.update(cv_features)
+        results.append(result_row)
+
+# ======== 保存特征结果 ========
+if results:
+    result_df = pd.DataFrame(results)
+    output_path = "E:\Energitic-project-1-main\charging_combined_plots\combined_features_cell_025.csv"
+    result_df.to_csv(output_path, index=False)
+    print(f"成功提取 {len(results)} 个循环的特征数据，保存至 {output_path}")
+    
+    # ===== 绘制特征变化曲线 =====
+    if cc_voltage_data or cv_current_data:
+        plt.figure(figsize=(12, 8))
+        
+        # CC充电时间
+        plt.subplot(2, 2, 1)
+        plt.plot(result_df['Cycle'], result_df['CC_charge_time'], 'bo-')
+        plt.title('CC Charging Time vs Cycle')
+        plt.xlabel('Cycle Number')
+        plt.ylabel('Time (s)')
+        plt.grid(True)
+        
+        # CV充电时间
+        plt.subplot(2, 2, 2)
+        plt.plot(result_df['Cycle'], result_df['CV_charge_time'], 'bo-')  # 改为蓝色
+        plt.title('CV Charging Time vs Cycle')
+        plt.xlabel('Cycle Number')
+        plt.ylabel('Time (s)')
+        plt.grid(True)
+        
+        # CC累积电荷
+        plt.subplot(2, 2, 3)
+        plt.plot(result_df['Cycle'], result_df['CC_accumulated_charge'], 'bo-')  # 改为蓝色
+        plt.title('CC Accumulated Charge vs Cycle')
+        plt.xlabel('Cycle Number')
+        plt.ylabel('Charge (Ah)')
+        plt.grid(True)
+        
+        # CV累积电荷
+        plt.subplot(2, 2, 4)
+        plt.plot(result_df['Cycle'], result_df['CV_accumulated_charge'], 'bo-')  # 改为蓝色
+        plt.title('CV Accumulated Charge vs Cycle')
+        plt.xlabel('Cycle Number')
+        plt.ylabel('Charge (Ah)')
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig("E:\Energitic-project-1-main\charging_combined_plots\charge_characteristics.png", dpi=300)
+        plt.show()
+        
+        # ===== 绘制CC阶段电压随循环变化 =====
+        if cc_voltage_data:
+            plt.figure(figsize=(10, 6))
+            ax1 = plt.gca()
+            
+            # 归一化循环索引用于颜色映射
+            norm_cc = plt.Normalize(min(cc_cycles), max(cc_cycles))
+            
+            # 绘制每个循环的CC阶段电压曲线
+            for i, (time, voltage) in enumerate(cc_voltage_data):
+                color = cmap_blue(norm_cc(cc_cycles[i]))
+                plt.plot(time, voltage, color=color, alpha=0.7)
+            
+            plt.title('   ')
+            plt.xlabel('Relative Time (s)')
+            plt.ylabel('Voltage (V)')
+            plt.grid(True)
+            
+            # 添加颜色条
+            sm = plt.cm.ScalarMappable(cmap=cmap_blue, norm=norm_cc)
+            sm.set_array([])
+            cbar = plt.colorbar(sm, ax=ax1)
+            cbar.set_label('Cycle Number')
+            
+            plt.tight_layout()
+            plt.savefig("E:\Energitic-project-1-main\charging_combined_plots\cc_voltage_vs_cycle.png", dpi=300)
+            plt.show()
+        else:
+            print("警告：没有满足条件(初始电流>0.4C且持续时间>1000s)的CC阶段数据")
+        
+        # ===== 绘制CV阶段电流随循环变化 =====
+        if cv_current_data:
+            plt.figure(figsize=(10, 6))
+            ax2 = plt.gca()
+            
+            # 归一化循环索引用于颜色映射
+            norm_cv = plt.Normalize(min(cv_cycles), max(cv_cycles))
+            
+            # 绘制每个循环的CV阶段电流曲线
+            for i, (time, current) in enumerate(cv_current_data):
+                color = cmap_blue(norm_cv(cv_cycles[i]))  # 使用蓝色映射
+                plt.plot(time, current, color=color, alpha=0.7)
+            
+            plt.title('  ')
+            plt.xlabel('Relative Time (s)')
+            plt.ylabel('Current (C-rate)')
+            plt.grid(True)
+            
+            # 添加颜色条
+            sm = plt.cm.ScalarMappable(cmap=cmap_blue, norm=norm_cv)
+            sm.set_array([])
+            cbar = plt.colorbar(sm, ax=ax2)
+            cbar.set_label('Cycle Number')
+            
+            plt.tight_layout()
+            plt.savefig("E:\Energitic-project-1-main\charging_combined_plots\cv_current_vs_cycle.png", dpi=300)
+            plt.show()
+        else:
+            print("警告：没有满足条件(初始电流>0.4C且持续时间>1000s)的CV阶段数据")
+        
+        # ===== 绘制CC和CV阶段关键参数对比 =====
+        if not result_df.empty:
+            plt.figure(figsize=(12, 8))
+            
+            # CC阶段电压斜率
+            plt.subplot(2, 2, 1)
+            plt.plot(result_df['Cycle'], result_df['CC_voltage_slope'], 'b-')
+            plt.title('CC Voltage Slope vs Cycle')
+            plt.xlabel('Cycle Number')
+            plt.ylabel('Slope (V/s)')
+            plt.grid(True)
+            
+            # CV阶段电流斜率
+            plt.subplot(2, 2, 2)
+            plt.plot(result_df['Cycle'], result_df['CV_current_slope'], 'b-')  # 改为蓝色
+            plt.title('CV Current Slope vs Cycle')
+            plt.xlabel('Cycle Number')
+            plt.ylabel('Slope (C-rate/s)')
+            plt.grid(True)
+            
+            # CC阶段电压标准差
+            plt.subplot(2, 2, 3)
+            plt.plot(result_df['Cycle'], result_df['CC_voltage_std'], 'b-')  # 改为蓝色
+            plt.title('CC Voltage Std Dev vs Cycle')
+            plt.xlabel('Cycle Number')
+            plt.ylabel('Std Dev (V)')
+            plt.grid(True)
+            
+            # CV阶段电流标准差
+            plt.subplot(2, 2, 4)
+            plt.plot(result_df['Cycle'], result_df['CV_current_std'], 'b-')  # 改为蓝色
+            plt.title('CV Current Std Dev vs Cycle')
+            plt.xlabel('Cycle Number')
+            plt.ylabel('Std Dev (C-rate)')
+            plt.grid(True)
+            
+            plt.tight_layout()
+            plt.savefig("E:\Energitic-project-1-main\charging_combined_plots\slope_std_comparison.png", dpi=300)
+            plt.show()
+    else:
+        print("警告：没有满足条件(初始电流>0.4C且持续时间>1000s)的特征数据，无法绘制图表")
+else:
+    print("未提取到满足初始电流条件的有效特征数据")
